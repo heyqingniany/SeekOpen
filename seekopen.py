@@ -34,6 +34,7 @@ from tkinter import (
 
 
 APP_NAME = "SeekOpen"
+APP_VERSION = "1.0.0"
 NO_EXTENSION = "<no-extension>"
 DEFAULT_IGNORED_EXTENSIONS = [".o", ".obj", ".d", ".dep", ".pyc", ".tmp"]
 DEFAULT_IGNORED_DIRECTORIES = [
@@ -501,7 +502,7 @@ class SeekOpenApp(Tk):
     def __init__(self) -> None:
         super().__init__()
         self.settings = AppConfig.load()
-        self.title(APP_NAME + " - 工程文件速览")
+        self.title(f"{APP_NAME} {APP_VERSION} - 工程速开")
         self.geometry(self.settings.window_geometry)
         self.minsize(900, 600)
         self.option_add("*Font", ("Microsoft YaHei UI", 9))

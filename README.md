@@ -4,9 +4,14 @@
 
 <h1 align="center">SeekOpen</h1>
 
-<p align="center">面向 Windows 调试场景的工程文件速览与多文件快捷打开工具。</p>
+<p align="center">
+  <strong>Project File Explorer &amp; Launcher for Windows</strong><br>
+  工程文件速览与多文件快捷打开工具
+</p>
 
 适合同时浏览上位机源码、Python 脚本、Keil 工程文件等；所有文件都由系统默认程序打开，因此 `.uvprojx`、`.py`、`.c` 等可以继续使用你已经关联的软件。
+
+当前版本：`v1.0.0`
 
 ## 启动
 
