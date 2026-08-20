@@ -34,8 +34,9 @@ from tkinter import (
 
 
 APP_NAME = "SeekOpen"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 NO_EXTENSION = "<no-extension>"
+MAX_RECENT_FILES = 50
 DEFAULT_IGNORED_EXTENSIONS = [".o", ".obj", ".d", ".dep", ".pyc", ".tmp"]
 DEFAULT_IGNORED_DIRECTORIES = [
     ".git",
@@ -71,6 +72,40 @@ def resource_path(*parts: str) -> Path:
     return base.joinpath(*parts)
 
 
+def path_identity(value: str | Path) -> str:
+    """返回适合去重的路径标识；不要求目标当前存在。"""
+    return os.path.normcase(os.path.abspath(os.path.expanduser(str(value))))
+
+
+def unique_path_strings(values: list[str | Path]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value).strip()
+        if not text:
+            continue
+        identity = path_identity(text)
+        if identity not in seen:
+            seen.add(identity)
+            result.append(str(Path(text)))
+    return result
+
+
+def add_favorite_paths(existing: list[str], additions: list[str | Path]) -> list[str]:
+    return unique_path_strings(existing + additions)
+
+
+def add_recent_file(existing: list[str], path: str | Path, limit: int = MAX_RECENT_FILES) -> list[str]:
+    identity = path_identity(path)
+    remaining = [value for value in existing if path_identity(value) != identity]
+    return unique_path_strings([path] + remaining)[:limit]
+
+
+def remove_path_records(existing: list[str], removals: list[str | Path]) -> list[str]:
+    identities = {path_identity(value) for value in removals}
+    return [value for value in existing if path_identity(value) not in identities]
+
+
 @dataclass
 class AppConfig:
     last_project: str = ""
@@ -83,6 +118,10 @@ class AppConfig:
     ignored_directories: list[str] = field(
         default_factory=lambda: DEFAULT_IGNORED_DIRECTORIES.copy()
     )
+    favorite_paths: list[str] = field(default_factory=list)
+    recent_files: list[str] = field(default_factory=list)
+    track_recent_files: bool = True
+    last_view: str = "project"
     window_geometry: str = "1180x760"
 
     @classmethod
@@ -111,6 +150,18 @@ class AppConfig:
                 filter_enabled=bool(data.get("filter_enabled", True)),
                 ignored_directories=sorted(
                     {str(x).strip() for x in data.get("ignored_directories", DEFAULT_IGNORED_DIRECTORIES) if str(x).strip()}
+                ),
+                favorite_paths=unique_path_strings(
+                    [str(value) for value in data.get("favorite_paths", [])]
+                ),
+                recent_files=unique_path_strings(
+                    [str(value) for value in data.get("recent_files", [])]
+                )[:MAX_RECENT_FILES],
+                track_recent_files=bool(data.get("track_recent_files", True)),
+                last_view=(
+                    str(data.get("last_view", "project"))
+                    if str(data.get("last_view", "project")) in {"project", "favorites", "recent"}
+                    else "project"
                 ),
                 window_geometry=str(data.get("window_geometry", "1180x760")),
             )
@@ -536,9 +587,9 @@ class SeekOpenApp(Tk):
         self.after(100, self._poll_results)
 
         if self.settings.last_project and Path(self.settings.last_project).is_dir():
-            self.open_project(Path(self.settings.last_project))
+            self.open_project(Path(self.settings.last_project), switch_view=False)
         else:
-            self.status_var.set("请选择一个工程文件夹")
+            self._on_view_changed()
 
     def _build_ui(self) -> None:
         style = ttk.Style(self)
@@ -592,7 +643,7 @@ class SeekOpenApp(Tk):
         title_box = ttk.Frame(header, style="Header.TFrame")
         title_box.pack(side=LEFT)
         ttk.Label(title_box, text="SeekOpen", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(title_box, text="工程文件速览 · 多文件快捷打开", style="Subtitle.TLabel").pack(anchor="w", pady=(1, 0))
+        ttk.Label(title_box, text="工程浏览 · 全局快捷访问 · 多文件速开", style="Subtitle.TLabel").pack(anchor="w", pady=(1, 0))
         ttk.Button(header, text="选择工程", command=self.choose_project, style="Accent.TButton").pack(side=RIGHT)
         ttk.Button(header, text="刷新  F5", command=self.refresh_project).pack(side=RIGHT, padx=(0, 8))
 
@@ -636,19 +687,31 @@ class SeekOpenApp(Tk):
         self._update_recent_menu()
         self._update_filter_summary()
 
-        content = ttk.Frame(main, style="Card.TFrame", padding=1)
-        content.pack(fill=BOTH, expand=True)
-        content.rowconfigure(0, weight=1)
-        content.columnconfigure(0, weight=1)
+        style.configure("TNotebook", background=colors["background"], borderwidth=0, tabmargins=(0, 0, 0, 0))
+        style.configure("TNotebook.Tab", padding=(18, 9), font=("Microsoft YaHei UI", 9), background="#E8EEF6", foreground=colors["muted"])
+        style.map(
+            "TNotebook.Tab",
+            background=[("selected", colors["surface"]), ("active", "#EFF4FA")],
+            foreground=[("selected", colors["accent"])],
+        )
+
+        self.view_notebook = ttk.Notebook(main)
+        self.view_notebook.pack(fill=BOTH, expand=True)
+
+        project_tab = ttk.Frame(self.view_notebook, style="Card.TFrame", padding=1)
+        project_tab.rowconfigure(0, weight=1)
+        project_tab.columnconfigure(0, weight=1)
+        self.view_notebook.add(project_tab, text="  当前工程  ")
+
         columns = ("type", "path")
-        self.tree = ttk.Treeview(content, columns=columns, selectmode="extended")
+        self.tree = ttk.Treeview(project_tab, columns=columns, selectmode="extended")
         self.tree.heading("#0", text="名称", anchor="w")
         self.tree.heading("type", text="类型", anchor="w")
         self.tree.heading("path", text="相对路径", anchor="w")
         self.tree.column("#0", width=300, minwidth=160)
         self.tree.column("type", width=165, minwidth=100, stretch=False)
         self.tree.column("path", width=520, minwidth=180)
-        scrollbar = ttk.Scrollbar(content, orient=VERTICAL, command=self.tree.yview)
+        scrollbar = ttk.Scrollbar(project_tab, orient=VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=scrollbar.set)
         self.tree.grid(row=0, column=0, sticky="nsew")
         scrollbar.grid(row=0, column=1, sticky="ns")
@@ -657,6 +720,58 @@ class SeekOpenApp(Tk):
         self.tree.bind("<Return>", lambda _: self.open_selected())
         self.tree.bind("<Button-3>", self._show_context_menu)
         self.tree.bind("<<TreeviewSelect>>", self._update_selection_status)
+
+        favorites_tab = ttk.Frame(self.view_notebook, style="Card.TFrame", padding=(10, 9, 10, 10))
+        favorites_tab.rowconfigure(1, weight=1)
+        favorites_tab.columnconfigure(0, weight=1)
+        self.view_notebook.add(favorites_tab, text="  ★ 快捷访问  ")
+        favorites_toolbar = ttk.Frame(favorites_tab, style="Card.TFrame")
+        favorites_toolbar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        ttk.Label(favorites_toolbar, text="可收藏工程内外的任意文件或文件夹", style="Status.TLabel").pack(side=LEFT)
+        ttk.Button(favorites_toolbar, text="添加文件", command=self.add_external_files).pack(side=RIGHT)
+        ttk.Button(favorites_toolbar, text="添加文件夹", command=self.add_external_folder).pack(side=RIGHT, padx=(0, 6))
+        ttk.Button(favorites_toolbar, text="移除选中 ×", command=self.remove_selected_records).pack(side=RIGHT, padx=(0, 6))
+        self.favorite_tree = self._create_path_list_tree(favorites_tab)
+        self.favorite_tree.grid(row=1, column=0, sticky="nsew")
+        favorite_scrollbar = ttk.Scrollbar(favorites_tab, orient=VERTICAL, command=self.favorite_tree.yview)
+        self.favorite_tree.configure(yscrollcommand=favorite_scrollbar.set)
+        favorite_scrollbar.grid(row=1, column=1, sticky="ns")
+
+        recent_tab = ttk.Frame(self.view_notebook, style="Card.TFrame", padding=(10, 9, 10, 10))
+        recent_tab.rowconfigure(1, weight=1)
+        recent_tab.columnconfigure(0, weight=1)
+        self.view_notebook.add(recent_tab, text="  最近打开  ")
+        recent_toolbar = ttk.Frame(recent_tab, style="Card.TFrame")
+        recent_toolbar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        self.track_recent_var = BooleanVar(value=self.settings.track_recent_files)
+        ttk.Checkbutton(
+            recent_toolbar,
+            text="记录最近打开的文件",
+            variable=self.track_recent_var,
+            command=self.toggle_recent_tracking,
+        ).pack(side=LEFT)
+        ttk.Button(recent_toolbar, text="清空记录", command=self.clear_recent_files).pack(side=RIGHT)
+        ttk.Button(recent_toolbar, text="移除选中 ×", command=self.remove_selected_records).pack(side=RIGHT, padx=(0, 6))
+        self.recent_tree = self._create_path_list_tree(recent_tab)
+        self.recent_tree.grid(row=1, column=0, sticky="nsew")
+        recent_scrollbar = ttk.Scrollbar(recent_tab, orient=VERTICAL, command=self.recent_tree.yview)
+        self.recent_tree.configure(yscrollcommand=recent_scrollbar.set)
+        recent_scrollbar.grid(row=1, column=1, sticky="ns")
+
+        self.project_tab = project_tab
+        self.favorites_tab = favorites_tab
+        self.recent_tab = recent_tab
+        self.favorite_item_paths: dict[str, Path] = {}
+        self.recent_item_paths: dict[str, Path] = {}
+        self._bind_path_list_tree(self.favorite_tree)
+        self._bind_path_list_tree(self.recent_tree)
+        self.favorite_tree.bind("<Button-1>", lambda event: self._handle_remove_column(event, "favorites"), add="+")
+        self.recent_tree.bind("<Button-1>", lambda event: self._handle_remove_column(event, "recent"), add="+")
+        self.view_notebook.bind("<<NotebookTabChanged>>", self._on_view_changed)
+        self._populate_favorites()
+        self._populate_recent_files()
+        initial_tabs = {"project": project_tab, "favorites": favorites_tab, "recent": recent_tab}
+        self.view_notebook.select(initial_tabs.get(self.settings.last_view, project_tab))
 
         bottom = ttk.Frame(self, style="Footer.TFrame", padding=(18, 9))
         bottom.pack(fill="x")
@@ -668,7 +783,10 @@ class SeekOpenApp(Tk):
         self.context_menu = Menu(self, tearoff=False)
         self.context_menu.add_command(label="打开", command=self.open_selected)
         self.context_menu.add_command(label="用系统默认程序打开", command=self.open_selected)
+        self.context_menu.add_command(label="固定到快捷访问", command=self.pin_selected)
+        self.context_menu.add_command(label="从当前列表移除", command=self.remove_selected_records)
         self.context_menu.add_separator()
+        self.context_menu.add_command(label="设为当前工程", command=self.set_selected_as_project)
         self.context_menu.add_command(label="在资源管理器中显示", command=self.reveal_selected)
         self.context_menu.add_command(label="在此处打开 CMD", command=self.open_cmd_here)
         self.context_menu.add_command(label="在此处打开 PowerShell", command=self.open_powershell_here)
@@ -677,6 +795,188 @@ class SeekOpenApp(Tk):
         self.context_menu.add_command(label="运行 Python 脚本（窗口保留）", command=lambda: self.run_python_selected(True))
         self.context_menu.add_separator()
         self.context_menu.add_command(label="复制完整路径", command=self.copy_paths)
+
+    def _create_path_list_tree(self, parent: ttk.Frame) -> ttk.Treeview:
+        tree = ttk.Treeview(
+            parent,
+            columns=("type", "path", "remove"),
+            selectmode="extended",
+        )
+        tree.heading("#0", text="名称", anchor="w")
+        tree.heading("type", text="类型", anchor="w")
+        tree.heading("path", text="完整路径", anchor="w")
+        tree.heading("remove", text="", anchor="center")
+        tree.column("#0", width=280, minwidth=150)
+        tree.column("type", width=165, minwidth=100, stretch=False)
+        tree.column("path", width=560, minwidth=220)
+        tree.column("remove", width=42, minwidth=42, stretch=False, anchor="center")
+        return tree
+
+    def _bind_path_list_tree(self, tree: ttk.Treeview) -> None:
+        tree.bind("<Double-1>", self._on_double_click)
+        tree.bind("<Return>", lambda _: self.open_selected())
+        tree.bind("<Delete>", lambda _: self.remove_selected_records())
+        tree.bind("<Button-3>", self._show_context_menu)
+        tree.bind("<<TreeviewSelect>>", self._update_selection_status)
+
+    def _active_view(self) -> str:
+        current = self.view_notebook.select()
+        if current == str(self.favorites_tab):
+            return "favorites"
+        if current == str(self.recent_tab):
+            return "recent"
+        return "project"
+
+    def _active_tree(self) -> ttk.Treeview:
+        view = self._active_view()
+        if view == "favorites":
+            return self.favorite_tree
+        if view == "recent":
+            return self.recent_tree
+        return self.tree
+
+    def _path_map_for_tree(self, tree: ttk.Treeview) -> dict[str, Path]:
+        if tree is self.favorite_tree:
+            return self.favorite_item_paths
+        if tree is self.recent_tree:
+            return self.recent_item_paths
+        return self.item_paths
+
+    def _populate_path_list(
+        self,
+        tree: ttk.Treeview,
+        item_paths: dict[str, Path],
+        values: list[str],
+    ) -> None:
+        tree.delete(*tree.get_children())
+        item_paths.clear()
+        for value in values:
+            path = Path(value)
+            exists = path.exists()
+            is_directory = path.is_dir() if exists else False
+            type_key = "<folder>" if is_directory else file_type_key(path)
+            type_name = self.shell_icons.type_name(type_key) if exists else "文件不存在"
+            icon = self._icon_for(type_key) if exists else None
+            item = tree.insert(
+                "",
+                END,
+                text=path.name or str(path),
+                values=(type_name, str(path), "×"),
+                image=icon if icon else "",
+                tags=("missing",) if not exists else (),
+            )
+            item_paths[item] = path
+        tree.tag_configure("missing", foreground="#A36A6A")
+
+    def _populate_favorites(self) -> None:
+        self._populate_path_list(
+            self.favorite_tree,
+            self.favorite_item_paths,
+            self.settings.favorite_paths,
+        )
+        self.view_notebook.tab(self.favorites_tab, text=f"  ★ 快捷访问 ({len(self.settings.favorite_paths)})  ")
+        if self._active_view() == "favorites":
+            self.status_var.set(f"快捷访问共 {len(self.settings.favorite_paths)} 项")
+
+    def _populate_recent_files(self) -> None:
+        self._populate_path_list(
+            self.recent_tree,
+            self.recent_item_paths,
+            self.settings.recent_files,
+        )
+        self.view_notebook.tab(self.recent_tab, text=f"  最近打开 ({len(self.settings.recent_files)})  ")
+        if self._active_view() == "recent":
+            state = "已开启记录" if self.settings.track_recent_files else "已暂停记录"
+            self.status_var.set(f"最近打开 {len(self.settings.recent_files)} 项 · {state}")
+
+    def _handle_remove_column(self, event: object, view: str) -> str | None:
+        tree = self.favorite_tree if view == "favorites" else self.recent_tree
+        if tree.identify_column(event.x) != "#3":  # type: ignore[attr-defined]
+            return None
+        row = tree.identify_row(event.y)  # type: ignore[attr-defined]
+        if not row:
+            return None
+        tree.selection_set(row)
+        self.remove_selected_records()
+        return "break"
+
+    def _on_view_changed(self, _: object = None) -> None:
+        if not hasattr(self, "status_var"):
+            return
+        view = self._active_view()
+        self.settings.last_view = view
+        self.settings.save()
+        if view == "favorites":
+            self._populate_favorites()
+        elif view == "recent":
+            self._populate_recent_files()
+        elif self.project_root:
+            self._populate_tree()
+        else:
+            self.status_var.set("请选择一个工程文件夹")
+
+    def add_external_files(self) -> None:
+        initial = str(self.project_root) if self.project_root else str(Path.home())
+        chosen = filedialog.askopenfilenames(title="添加文件到快捷访问", initialdir=initial)
+        if chosen:
+            self._add_to_favorites([Path(value) for value in chosen])
+
+    def add_external_folder(self) -> None:
+        initial = str(self.project_root) if self.project_root else str(Path.home())
+        chosen = filedialog.askdirectory(title="添加文件夹到快捷访问", initialdir=initial, mustexist=True)
+        if chosen:
+            self._add_to_favorites([Path(chosen)])
+
+    def _add_to_favorites(self, paths: list[Path]) -> None:
+        before = len(self.settings.favorite_paths)
+        self.settings.favorite_paths = add_favorite_paths(self.settings.favorite_paths, paths)
+        self.settings.save()
+        self._populate_favorites()
+        added = len(self.settings.favorite_paths) - before
+        self.status_var.set(f"已添加 {added} 项到快捷访问" if added else "所选项目已在快捷访问中")
+
+    def pin_selected(self) -> None:
+        self._add_to_favorites(self._selected_paths())
+
+    def remove_selected_records(self) -> None:
+        view = self._active_view()
+        paths = self._selected_paths()
+        if not paths or view == "project":
+            return
+        if view == "favorites":
+            self.settings.favorite_paths = remove_path_records(self.settings.favorite_paths, paths)
+            self._populate_favorites()
+        else:
+            self.settings.recent_files = remove_path_records(self.settings.recent_files, paths)
+            self._populate_recent_files()
+        self.settings.save()
+        self.status_var.set(f"已从列表移除 {len(paths)} 项；原文件未删除")
+
+    def clear_recent_files(self) -> None:
+        if not self.settings.recent_files:
+            return
+        if not messagebox.askyesno(APP_NAME, "清空全部最近打开记录？\n不会删除任何真实文件。"):
+            return
+        self.settings.recent_files = []
+        self.settings.save()
+        self._populate_recent_files()
+
+    def toggle_recent_tracking(self) -> None:
+        self.settings.track_recent_files = self.track_recent_var.get()
+        self.settings.save()
+        self._populate_recent_files()
+
+    def _record_recent_file(self, path: Path) -> None:
+        if not self.settings.track_recent_files or not path.is_file():
+            return
+        self.settings.recent_files = add_recent_file(self.settings.recent_files, path)
+        self.settings.save()
+        self._populate_recent_files()
+
+    def set_selected_as_project(self) -> None:
+        paths = self._selected_paths()
+        if len(paths) == 1 and paths[0].is_dir():
+            self.open_project(paths[0])
 
     def _bind_shortcuts(self) -> None:
         self.bind("<F5>", lambda _: self.refresh_project())
@@ -690,7 +990,7 @@ class SeekOpenApp(Tk):
         if chosen:
             self.open_project(Path(chosen))
 
-    def open_project(self, path: Path) -> None:
+    def open_project(self, path: Path, switch_view: bool = True) -> None:
         path = path.resolve()
         if not path.is_dir():
             messagebox.showerror(APP_NAME, f"文件夹不存在：\n{path}")
@@ -702,6 +1002,8 @@ class SeekOpenApp(Tk):
         self.settings.recent_projects = recent[:10]
         self.settings.save()
         self._update_recent_menu()
+        if switch_view:
+            self.view_notebook.select(self.project_tab)
         self.refresh_project()
 
     def refresh_project(self) -> None:
@@ -713,7 +1015,8 @@ class SeekOpenApp(Tk):
         generation = self.scan_generation
         self.tree.delete(*self.tree.get_children())
         self.item_paths.clear()
-        self.status_var.set("正在扫描工程…")
+        if self._active_view() == "project":
+            self.status_var.set("正在扫描工程…")
         root = self.project_root
         ignored_directories = set(self.settings.ignored_directories)
 
@@ -790,7 +1093,9 @@ class SeekOpenApp(Tk):
             else:
                 file_count += 1
         suffix = f"（搜索：{term}）" if term else ""
-        self.status_var.set(f"{directory_count} 个文件夹，{file_count} 个文件 {suffix}")
+        self.view_notebook.tab(self.project_tab, text=f"  当前工程 ({file_count})  ")
+        if self._active_view() == "project":
+            self.status_var.set(f"{directory_count} 个文件夹，{file_count} 个文件 {suffix}")
 
     def _icon_for(self, type_key: str) -> PhotoImage | None:
         if type_key in self.tk_icons:
@@ -834,20 +1139,31 @@ class SeekOpenApp(Tk):
         visit()
 
     def _selected_paths(self) -> list[Path]:
-        return [self.item_paths[item] for item in self.tree.selection() if item in self.item_paths]
+        tree = self._active_tree()
+        item_paths = self._path_map_for_tree(tree)
+        return [item_paths[item] for item in tree.selection() if item in item_paths]
 
     def _on_double_click(self, _: object) -> None:
         selected = self._selected_paths()
-        if selected and selected[0].is_file():
-            self._open_path(selected[0])
+        if not selected:
+            return
+        if self._active_view() == "project" and selected[0].is_dir():
+            return
+        self.open_selected()
 
     def _show_context_menu(self, event: object) -> None:
-        row = self.tree.identify_row(event.y)  # type: ignore[attr-defined]
+        active_tree = self._active_tree()
+        row = active_tree.identify_row(event.y)  # type: ignore[attr-defined]
         if row:
-            if row not in self.tree.selection():
-                self.tree.selection_set(row)
+            if row not in active_tree.selection():
+                active_tree.selection_set(row)
             selected = self._selected_paths()
             python_only = bool(selected) and all(p.is_file() and p.suffix.lower() == ".py" for p in selected)
+            removable = self._active_view() in {"favorites", "recent"}
+            can_set_project = len(selected) == 1 and selected[0].is_dir()
+            self.context_menu.entryconfigure("固定到快捷访问", state="disabled" if self._active_view() == "favorites" else "normal")
+            self.context_menu.entryconfigure("从当前列表移除", state="normal" if removable else "disabled")
+            self.context_menu.entryconfigure("设为当前工程", state="normal" if can_set_project else "disabled")
             self.context_menu.entryconfigure("运行 Python 脚本", state="normal" if python_only else "disabled")
             self.context_menu.entryconfigure("运行 Python 脚本（窗口保留）", state="normal" if python_only else "disabled")
             self.context_menu.tk_popup(event.x_root, event.y_root)  # type: ignore[attr-defined]
@@ -860,6 +1176,7 @@ class SeekOpenApp(Tk):
         for path in paths:
             try:
                 self._open_path(path)
+                self._record_recent_file(path)
             except OSError as exc:
                 errors.append(f"{path.name}: {exc}")
         if errors:
@@ -913,6 +1230,7 @@ class SeekOpenApp(Tk):
         for path in paths:
             command = ["cmd.exe", "/K" if keep_open else "/C", str(python_executable), str(path)]
             subprocess.Popen(command, cwd=str(path.parent), creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
+            self._record_recent_file(path)
 
     def copy_paths(self) -> None:
         paths = self._selected_paths()

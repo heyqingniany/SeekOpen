@@ -8,10 +8,13 @@ from seekopen import (
     AppConfig,
     FileRecord,
     NO_EXTENSION,
+    add_favorite_paths,
+    add_recent_file,
     file_type_key,
     filter_records_by_type,
     normalize_extension,
     normalize_extensions,
+    remove_path_records,
     scan_project,
 )
 
@@ -64,6 +67,44 @@ class SeekOpenCoreTests(unittest.TestCase):
                 loaded = AppConfig.load()
 
             self.assertFalse(loaded.filter_enabled)
+
+    def test_favorites_are_deduplicated_without_reordering(self):
+        first = Path("C:/work/main.py")
+        second = Path("C:/tools/flash.py")
+        favorites = add_favorite_paths([str(first)], [first, second, first])
+
+        self.assertEqual(favorites, [str(first), str(second)])
+
+    def test_recent_files_move_to_front_and_respect_limit(self):
+        recent = [str(Path(f"C:/files/{index}.txt")) for index in range(4)]
+        updated = add_recent_file(recent, recent[2], limit=3)
+
+        self.assertEqual(updated, [recent[2], recent[0], recent[1]])
+
+    def test_remove_records_does_not_touch_other_paths(self):
+        paths = ["C:/one.py", "C:/two.py", "C:/three.py"]
+        self.assertEqual(
+            remove_path_records(paths, ["C:/two.py"]),
+            ["C:/one.py", "C:/three.py"],
+        )
+
+    def test_quick_access_settings_are_persisted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings_path = Path(directory) / "settings.json"
+            with patch("seekopen.config_path", return_value=settings_path):
+                config = AppConfig(
+                    favorite_paths=["C:/tools/run.py"],
+                    recent_files=["C:/work/main.c"],
+                    track_recent_files=False,
+                    last_view="favorites",
+                )
+                config.save()
+                loaded = AppConfig.load()
+
+            self.assertEqual(loaded.favorite_paths, [str(Path("C:/tools/run.py"))])
+            self.assertEqual(loaded.recent_files, [str(Path("C:/work/main.c"))])
+            self.assertFalse(loaded.track_recent_files)
+            self.assertEqual(loaded.last_view, "favorites")
 
 
 if __name__ == "__main__":
